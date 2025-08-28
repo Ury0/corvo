@@ -1,438 +1,224 @@
-/*
-  QuadControl_ArduinoUno.ino
-  Controle básico de quadricóptero para Arduino Uno (ATmega328P)
-
-  Funcionalidades:
-  - Leitura MPU6050 via I2C (accel + gyro)
-  - Filtro complementar (opção de ativar Kalman 1D)
-  - Parsing manual do NMEA $GPGGA via SoftwareSerial (GY-GPS6MV2)
-  - PID para Roll, Pitch, Yaw
-  - Saída PWM com Servo.writeMicroseconds para ESCs (1000..2000us)
-
-  Notas:
-  - Substitua throttleInput pela leitura do seu receptor RC (PWM/PPM/SBUS)
-  - Teste com hélices removidas inicialmente!
-*/
-
 #include <Wire.h>
-#include <Servo.h>
+#include <TinyGPS++.h>
 #include <SoftwareSerial.h>
-#include <math.h>
+#include <Servo.h>
 
-// ============================ CONFIGURAÇÃO ============================
-// MPU6050 I2C address
-#define MPU_ADDR 0x68
+// === GPS ===
+static const int RXPin = 0, TXPin = 1; 
+static const uint32_t GPSBaud = 9600;
 
-// GPS via SoftwareSerial (conecte TX do GPS ao RX_PIN)
-const uint8_t GPS_RX_PIN = 0;
-const uint8_t GPS_TX_PIN = 1;
-SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN); // RX, TX
+TinyGPSPlus gps;
+SoftwareSerial gpsSerial(RXPin, TXPin);
 
-// ESC / motors pins (usar pinos PWM virtuais via Servo lib)
-const uint8_t PIN_M1 = 3;  // Motor 1 (ex: front-left)
-const uint8_t PIN_M2 = 5;  // Motor 2 (ex: front-right)
-const uint8_t PIN_M3 = 6;  // Motor 3 (ex: rear-right)
-const uint8_t PIN_M4 = 9; // Motor 4 (ex: rear-left)
-// OBS: pinos escolhidos suportam Servo/Timer. Ajuste conforme seu hardware.
+// === MPU6050 + Kalman ===
+#define MPU6050_ADDR 0x68
+#define ACCEL_SENS 16384.0f
+#define GYRO_SENS 131.0f
 
-// ESC signal limits (microseconds)
-const int ESC_MIN = 1000;
-const int ESC_MAX = 2000;
+// offsets calibrados
+int16_t ax_off=0, ay_off=0, az_off=0;
+int16_t gx_off=0, gy_off=0, gz_off=0;
 
-// Sensor scaling (MPU6050 default assumed: accel ±2g, gyro ±250 dps)
-const float ACCEL_SCALE = 16384.0; // LSB/g
-const float GYRO_SCALE  = 131.0;   // LSB/(deg/s)
-
-// Filtro complementar
-const float ALPHA = 0.98; // peso do giroscópio na fusão (0..1). Ajustar entre 0.95-0.995
-
-// Opcional: habilitar Kalman 1D por eixo (descomente para usar)
-// #define USE_KALMAN
-
-// PID parâmetros iniciais (tune estes valores)
-struct PIDParams {
-  float Kp;
-  float Ki;
-  float Kd;
-  float outputMin;
-  float outputMax;
+struct Kalman1D {
+  float angle = 0, bias = 0;
+  float P00=1, P01=0, P10=0, P11=1;
+  float Q_angle=0.001f, Q_bias=0.003f, R_measure=0.03f;
+  float update(float newAngle, float newRate, float dt) {
+    float rate = newRate - bias;
+    angle += dt * rate;
+    P00 += dt*(dt*P11 - P01 - P10 + Q_angle);
+    P01 -= dt*P11;
+    P10 -= dt*P11;
+    P11 += Q_bias * dt;
+    float y = newAngle - angle;
+    float S = P00 + R_measure;
+    float K0 = P00 / S;
+    float K1 = P10 / S;
+    angle += K0 * y;
+    bias += K1 * y;
+    float P00_temp = P00;
+    float P01_temp = P01;
+    P00 -= K0 * P00_temp;
+    P01 -= K0 * P01_temp;
+    P10 -= K1 * P00_temp;
+    P11 -= K1 * P01_temp;
+    return angle;
+  }
+  void setAngle(float a) { angle = a; }
 };
-PIDParams pidRoll  = {4.0, 0.01, 0.6, -400, 400};
-PIDParams pidPitch = {4.0, 0.01, 0.6, -400, 400};
-PIDParams pidYaw   = {3.0, 0.005, 0.2, -200, 200};
 
-// Desired angles (setpoint). Para nível: 0.0.
-float setRoll  = 0.0;
-float setPitch = 0.0;
-float setYaw   = 0.0; // se usar yaw hold
-
-// Throttle (1000..2000). Substituir pela leitura do rádio.
-int throttleInput = 1200; // valor inicial para teste (sempre ajustar com cuidado)
-
-// ============================ VARIÁVEIS GLOBAIS ============================
-Servo esc1, esc2, esc3, esc4;
+Kalman1D kfRoll, kfPitch, kfLat, kfLon;
 
 unsigned long lastMicros = 0;
 
-// MPU raw
-int16_t ax_raw, ay_raw, az_raw;
-int16_t gx_raw, gy_raw, gz_raw;
-
-// Angulos estimados (graus)
-float rollAcc, pitchAcc;      // ângulos a partir do acelerômetro
-float rollEstimate = 0.0;     // estimativa final (complementar/kalman)
-float pitchEstimate = 0.0;
-float yawEstimate = 0.0;      // integração do gyro Z (deriva)
-
-// ============================ KALMAN 1D (opcional) ============================
-#ifdef USE_KALMAN
-// Simples Kalman 1D por eixo (angle, bias)
-class Kalman {
-public:
-  float Q_angle, Q_bias, R_measure;
-  float angle; // estimativa do angulo
-  float bias;
-  float P[2][2];
-
-  Kalman() {
-    Q_angle = 0.001f;
-    Q_bias = 0.003f;
-    R_measure = 0.03f;
-    angle = 0.0f; bias = 0.0f;
-    P[0][0] = 0; P[0][1] = 0; P[1][0] = 0; P[1][1] = 0;
-  }
-  float getAngle(float newAngle, float newRate, float dt) {
-    // Predict
-    float rate = newRate - bias;
-    angle += dt * rate;
-    P[0][0] += dt * (dt*P[1][1] - P[0][1] - P[1][0] + Q_angle);
-    P[0][1] -= dt * P[1][1];
-    P[1][0] -= dt * P[1][1];
-    P[1][1] += Q_bias * dt;
-
-    // Update
-    float S = P[0][0] + R_measure;
-    float K0 = P[0][0] / S;
-    float K1 = P[1][0] / S;
-    float y = newAngle - angle;
-    angle += K0 * y;
-    bias  += K1 * y;
-    float P00 = P[0][0], P01 = P[0][1], P10 = P[1][0], P11 = P[1][1];
-    P[0][0] -= K0 * P00;
-    P[0][1] -= K0 * P01;
-    P[1][0] -= K1 * P00;
-    P[1][1] -= K1 * P01;
-    return angle;
-  }
-};
-Kalman kalmanRoll, kalmanPitch;
-#endif
-
-// ============================ PID CONTROL ============================
-class PID {
-public:
-  PIDParams params;
-  float integral;
-  float lastError;
-  PID(PIDParams p) : params(p), integral(0.0), lastError(0.0) {}
-  float compute(float setpoint, float measured, float dt) {
-    float error = setpoint - measured;
-    integral += error * dt;
-    // anti-windup
-    if (integral * params.Ki > params.outputMax) integral = params.outputMax / params.Ki;
-    if (integral * params.Ki < params.outputMin) integral = params.outputMin / params.Ki;
-    float derivative = (error - lastError) / dt;
-    lastError = error;
-    float out = params.Kp * error + params.Ki * integral + params.Kd * derivative;
-    if (out > params.outputMax) out = params.outputMax;
-    if (out < params.outputMin) out = params.outputMin;
-    return out;
-  }
-  void reset() { integral = 0; lastError = 0; }
-};
-
-PID pid_controller_roll(pidRoll);
-PID pid_controller_pitch(pidPitch);
-PID pid_controller_yaw(pidYaw);
-
-// ============================ GPS PARSING $GPGGA ============================
-char gpsLine[120];
-uint8_t gpsLineIndex = 0;
-float gpsLatitude = 0.0;
-float gpsLongitude = 0.0;
-bool gpsFix = false;
-
-void parseGPGGA(const char* line) {
-  // expected format: $GPGGA,time,lat,NS,lon,EW,fix,... e.g.:
-  // $GPGGA,123519,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,*47
-  // Tokenize by commas
-  char buf[120];
-  strncpy(buf, line, sizeof(buf)-1);
-  buf[sizeof(buf)-1] = 0;
-
-  char* tokens[20];
-  uint8_t nt = 0;
-  char* p = strtok(buf, ",");
-  while (p && nt < 20) {
-    tokens[nt++] = p;
-    p = strtok(NULL, ",");
-  }
-  if (nt < 7) return;
-  if (strcmp(tokens[0], "$GPGGA") != 0) return;
-
-  const char* latStr = tokens[2];
-  const char* ns = tokens[3];
-  const char* lonStr = tokens[4];
-  const char* ew = tokens[5];
-  const char* fixStr = tokens[6];
-
-  int fix = atoi(fixStr);
-  if (fix == 0) {
-    gpsFix = false;
-    return;
-  }
-  gpsFix = true;
-
-  // Convert lat ddmm.mmmm to decimal degrees
-  if (strlen(latStr) > 3 && strlen(lonStr) > 4) {
-    float latVal = atof(latStr);
-    int latDeg = int(latVal / 100);
-    float latMin = latVal - latDeg * 100.0;
-    float latDecimal = latDeg + latMin / 60.0;
-    if (ns && ns[0] == 'S') latDecimal = -latDecimal;
-
-    float lonVal = atof(lonStr);
-    int lonDeg = int(lonVal / 100);
-    float lonMin = lonVal - lonDeg * 100.0;
-    float lonDecimal = lonDeg + lonMin / 60.0;
-    if (ew && ew[0] == 'W') lonDecimal = -lonDecimal;
-
-    gpsLatitude = latDecimal;
-    gpsLongitude = lonDecimal;
-  }
-}
-
-// Read GPS line (non-blocking)
-void gpsReadLoop() {
-  while (gpsSerial.available()) {
-    char c = gpsSerial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      gpsLine[gpsLineIndex] = 0;
-      if (gpsLineIndex > 0) {
-        // Process line
-        if (strncmp(gpsLine, "$GPGGA", 6) == 0) {
-          parseGPGGA(gpsLine);
-        }
-      }
-      gpsLineIndex = 0;
-    } else {
-      if (gpsLineIndex < sizeof(gpsLine)-1) {
-        gpsLine[gpsLineIndex++] = c;
-      } else {
-        // overflow
-        gpsLineIndex = 0;
-      }
-    }
-  }
-}
-
-// ============================ MPU6050 ===================================
-void mpuWrite(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-
-void mpuInit() {
+// --- Funções MPU ---
+void setupMPU() {
   Wire.begin();
-  delay(100);
-  // Wake up
-  mpuWrite(0x6B, 0x00); // PWR_MGMT_1 = 0 (wake)
-  // Set accel range to ±2g (0) and gyro to ±250 dps (0) (default)
-  mpuWrite(0x1C, 0x00); // ACCEL_CONFIG
-  mpuWrite(0x1B, 0x00); // GYRO_CONFIG
-  delay(50);
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B); Wire.write(0); 
+  Wire.endTransmission(true);
 }
 
-bool readMPU6050() {
-  Wire.beginTransmission(MPU_ADDR);
-  Wire.write(0x3B); // starting register for ACCEL_XOUT_H
-  if (Wire.endTransmission(false) != 0) return false;
-  Wire.requestFrom(MPU_ADDR, (uint8_t)14);
-  if (Wire.available() < 14) return false;
-  ax_raw = (Wire.read() << 8) | Wire.read();
-  ay_raw = (Wire.read() << 8) | Wire.read();
-  az_raw = (Wire.read() << 8) | Wire.read();
-  gx_raw = (Wire.read() << 8) | Wire.read();
-  gy_raw = (Wire.read() << 8) | Wire.read();
-  gz_raw = (Wire.read() << 8) | Wire.read();
-  return true;
+void readMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR,14,true);
+  ax=(Wire.read()<<8)|Wire.read();
+  ay=(Wire.read()<<8)|Wire.read();
+  az=(Wire.read()<<8)|Wire.read();
+  Wire.read(); Wire.read(); // ignora temp
+  gx=(Wire.read()<<8)|Wire.read();
+  gy=(Wire.read()<<8)|Wire.read();
+  gz=(Wire.read()<<8)|Wire.read();
+
+  // aplica offsets
+  ax -= ax_off;
+  ay -= ay_off;
+  az -= az_off;
+  gx -= gx_off;
+  gy -= gy_off;
+  gz -= gz_off;
 }
 
-// ============================ SETUP & LOOP ===============================
-void setup() {
+// --- Calibração ---
+void calibrateMPU() {
+  long ax_sum=0, ay_sum=0, az_sum=0;
+  long gx_sum=0, gy_sum=0, gz_sum=0;
+
+  const int N = 2000; // nº de amostras
+  Serial.println("Calibrando MPU6050... mantenha o drone parado na mesa");
+
+  for(int i=0; i<N; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    readMPU(ax, ay, az, gx, gy, gz);
+
+    ax_sum += ax; ay_sum += ay; az_sum += az;
+    gx_sum += gx; gy_sum += gy; gz_sum += gz;
+
+    delay(3);
+  }
+
+  ax_off = ax_sum / N;
+  ay_off = ay_sum / N;
+  az_off = (az_sum / N) - ACCEL_SENS; // ajusta Z para ~1g
+  gx_off = gx_sum / N;
+  gy_off = gy_sum / N;
+  gz_off = gz_sum / N;
+
+  Serial.println("Calibracao concluida!");
+}
+
+// --- PID ---
+float Kp = 1.5, Ki = 0.0, Kd = 0.8;
+float Kp_yaw = 2.0, Ki_yaw = 0.0, Kd_yaw = 1.0;
+
+float errSumRoll=0, lastErrRoll=0;
+float errSumPitch=0, lastErrPitch=0;
+float errSumYaw=0, lastErrYaw=0;
+
+float computePID(float setpoint, float input, float &errSum, float &lastErr, float dt, float Kp, float Ki, float Kd) {
+  float error = setpoint - input;
+  errSum += error * dt;
+  float dErr = (error - lastErr) / dt;
+  lastErr = error;
+  return Kp * error + Ki * errSum + Kd * dErr;
+}
+
+// --- Motores ---
+#define M1 3
+#define M2 5
+#define M3 6
+#define M4 9
+
+Servo motor1, motor2, motor3, motor4;
+int throttle = 1200; // valor inicial
+
+// --- Setup ---
+void setup(){
   Serial.begin(115200);
-  while (!Serial) ; // esperar Serial
-  Serial.println(F("QuadControl - Arduino Uno"));
-  Serial.println(F("Iniciando MPU6050 e GPS..."));
+  gpsSerial.begin(GPSBaud);
 
-  // Initialize MPU
-  mpuInit();
+  setupMPU();
+  calibrateMPU(); // <<=== CALIBRAÇÃO AUTOMÁTICA
 
-  // Initialize GPS serial (default GPS baud 9600)
-  gpsSerial.begin(9600);
+  motor1.attach(M1);
+  motor2.attach(M2);
+  motor3.attach(M3);
+  motor4.attach(M4);
 
-  // Initialize ESCs
-  esc1.attach(PIN_M1);
-  esc2.attach(PIN_M2);
-  esc3.attach(PIN_M3);
-  esc4.attach(PIN_M4);
+  motor1.writeMicroseconds(1000);
+  motor2.writeMicroseconds(1000);
+  motor3.writeMicroseconds(1000);
+  motor4.writeMicroseconds(1000);
 
-  // Armar ESCs com sinal minimo por 1s (sem hélices)
-  esc1.writeMicroseconds(ESC_MIN);
-  esc2.writeMicroseconds(ESC_MIN);
-  esc3.writeMicroseconds(ESC_MIN);
-  esc4.writeMicroseconds(ESC_MIN);
-  delay(1000);
-
-  // read initial MPU to initialize angles
-  if (readMPU6050()) {
-    float ax = ax_raw / ACCEL_SCALE;
-    float ay = ay_raw / ACCEL_SCALE;
-    float az = az_raw / ACCEL_SCALE;
-    // compute angles from accelerometer (degrees)
-    rollAcc = atan2(ay, az) * 180.0 / M_PI;
-    pitchAcc = atan2(-ax, sqrt(ay*ay + az*az)) * 180.0 / M_PI;
-    rollEstimate = rollAcc;
-    pitchEstimate = pitchAcc;
-    yawEstimate = 0.0;
-#ifdef USE_KALMAN
-    kalmanRoll.angle = rollAcc;
-    kalmanPitch.angle = pitchAcc;
-#endif
-  }
-
+  delay(2000); // arm ESCs
+  Serial.println("IMU + GPS + Kalman + PID iniciado");
   lastMicros = micros();
-  Serial.println(F("Setup completo. Tune os PID conforme necessário."));
 }
 
-// Main loop runs at variable rate; dt computed from micros()
+// --- Loop ---
 void loop() {
-  unsigned long nowMicros = micros();
-  float dt = (nowMicros - lastMicros) / 1000000.0f;
-  if (dt <= 0) dt = 0.0001;
-  lastMicros = nowMicros;
+  unsigned long now = micros();
+  float dt = (now - lastMicros) / 1e6;
+  lastMicros = now;
 
-  // Read sensors
-  if (!readMPU6050()) {
-    // failed to read MPU this cycle
-  } else {
-    // Convert raw to physical units
-    float ax = ax_raw / ACCEL_SCALE;
-    float ay = ay_raw / ACCEL_SCALE;
-    float az = az_raw / ACCEL_SCALE;
-    float gx = gx_raw / GYRO_SCALE; // deg/s
-    float gy = gy_raw / GYRO_SCALE;
-    float gz = gz_raw / GYRO_SCALE;
+  int16_t ax, ay, az, gx, gy, gz;
+  readMPU(ax,ay,az,gx,gy,gz);
 
-    // Compute accelerometer angles (degrees)
-    rollAcc  = atan2(ay, az) * 180.0 / M_PI;
-    pitchAcc = atan2(-ax, sqrt(ay*ay + az*az)) * 180.0 / M_PI;
+  float axg = (float)ax/ACCEL_SENS;
+  float ayg = (float)ay/ACCEL_SENS;
+  float azg = (float)az/ACCEL_SENS;
 
-    // Complementary filter for roll and pitch
-#ifdef USE_KALMAN
-    // Kalman uses accel angle and gyro rate
-    rollEstimate  = kalmanRoll.getAngle(rollAcc,  gx, dt);
-    pitchEstimate = kalmanPitch.getAngle(pitchAcc, gy, dt);
-#else
-    // Integrate gyro to angle
-    rollEstimate  = ALPHA * (rollEstimate  + gx * dt) + (1.0f - ALPHA) * rollAcc;
-    pitchEstimate = ALPHA * (pitchEstimate + gy * dt) + (1.0f - ALPHA) * pitchAcc;
-#endif
+  float gxds=(float)gx/GYRO_SENS;
+  float gyds=(float)gy/GYRO_SENS;
 
-    // Yaw - only gyro integration (drifts)
-    yawEstimate += gz * dt;
-    // normalize yaw to [-180,180]
-    if (yawEstimate > 180.0) yawEstimate -= 360.0;
-    if (yawEstimate < -180.0) yawEstimate += 360.0;
-  }
+  float rollAcc  = atan2f(ayg, azg) * 180/PI;
+  float pitchAcc = atan2f(-axg, sqrtf(ayg*ayg+azg*azg)) * 180/PI;
 
-  // Read GPS (non-blocking)
-  gpsReadLoop();
+  float roll  = kfRoll.update(rollAcc,gxds,dt);
+  float pitch = kfPitch.update(pitchAcc,gyds,dt);
 
-  // === Control: compute PID outputs (units: degrees -> mix to microseconds later) ===
-  float rollOut  = pid_controller_roll.compute(setRoll, rollEstimate, dt);
-  float pitchOut = pid_controller_pitch.compute(setPitch, pitchEstimate, dt);
-  float yawOut   = pid_controller_yaw.compute(setYaw, yawEstimate, dt);
-
-  // Motor mixing (X configuration). Mix outputs into motor microsecond adjustments.
-  // Define mixing signs carefully depending on motor layout & rotation directions.
-  // A common X-mix (assuming motors: 1=FrontLeft, 2=FrontRight, 3=RearRight, 4=RearLeft):
-  // m1 = throttle + pitch + roll + yaw
-  // m2 = throttle + pitch - roll - yaw
-  // m3 = throttle - pitch - roll + yaw
-  // m4 = throttle - pitch + roll - yaw
-  // Here rollOut/pitchOut/yawOut are in some units; we'll add them to throttle (center 1500)
-  float mix1 = throttleInput + pitchOut + rollOut + yawOut;
-  float mix2 = throttleInput + pitchOut - rollOut - yawOut;
-  float mix3 = throttleInput - pitchOut - rollOut + yawOut;
-  float mix4 = throttleInput - pitchOut + rollOut - yawOut;
-
-  // Constrain mixes and send to ESCs
-  int out1 = constrain((int)mix1, ESC_MIN, ESC_MAX);
-  int out2 = constrain((int)mix2, ESC_MIN, ESC_MAX);
-  int out3 = constrain((int)mix3, ESC_MIN, ESC_MAX);
-  int out4 = constrain((int)mix4, ESC_MIN, ESC_MAX);
-
-  esc1.writeMicroseconds(out1);
-  esc2.writeMicroseconds(out2);
-  esc3.writeMicroseconds(out3);
-  esc4.writeMicroseconds(out4);
-
-  // Telemetry via Serial (print at lower rate to avoid flooding)
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint >= 100) { // 10 Hz
-    lastPrint = millis();
-    Serial.print("R:");
-    Serial.print(rollEstimate, 2);
-    Serial.print(" P:");
-    Serial.print(pitchEstimate, 2);
-    Serial.print(" Y:");
-    Serial.print(yawEstimate, 2);
-    Serial.print(" | Th:");
-    Serial.print(throttleInput);
-    Serial.print(" M1:");
-    Serial.print(out1);
-    Serial.print(" M2:");
-    Serial.print(out2);
-    Serial.print(" M3:");
-    Serial.print(out3);
-    Serial.print(" M4:");
-    Serial.print(out4);
-    if (gpsFix) {
-      Serial.print(" | GPS: ");
-      Serial.print(gpsLatitude, 6);
-      Serial.print(", ");
-      Serial.print(gpsLongitude, 6);
-    } else {
-      Serial.print(" | GPS: NO FIX");
+  // GPS leitura
+  while (gpsSerial.available() > 0) {
+    if (gps.encode(gpsSerial.read()) && gps.location.isUpdated()) {
+        double lat = gps.location.lat();
+        double lon = gps.location.lng();
+        double latF = kfLat.update(lat, 0, dt);
+        double lonF = kfLon.update(lon, 0, dt);
+        Serial.print("Lat:"); Serial.print(latF,6);
+        Serial.print("\tLon:"); Serial.print(lonF,6);
     }
-    Serial.println();
   }
 
-  // short delay to let other tasks run; overall loop dt is driven by micros()
-  // but avoid busy spinning
-  delay(2);
+  // === PID controle ===
+  float setRoll = 0, setPitch = 0, setYaw = 0;
+  float rollPID  = computePID(setRoll, roll,  errSumRoll,  lastErrRoll,  dt, Kp, Ki, Kd);
+  float pitchPID = computePID(setPitch, pitch, errSumPitch, lastErrPitch, dt, Kp, Ki, Kd);
+  float yawPID   = computePID(setYaw, 0, errSumYaw, lastErrYaw, dt, Kp_yaw, Ki_yaw, Kd_yaw);
+
+  int m1Signal = throttle + pitchPID + rollPID - yawPID;
+  int m2Signal = throttle + pitchPID - rollPID + yawPID;
+  int m3Signal = throttle - pitchPID - rollPID - yawPID;
+  int m4Signal = throttle - pitchPID + rollPID + yawPID;
+
+  m1Signal = constrain(m1Signal, 1000, 2000);
+  m2Signal = constrain(m2Signal, 1000, 2000);
+  m3Signal = constrain(m3Signal, 1000, 2000);
+  m4Signal = constrain(m4Signal, 1000, 2000);
+
+  motor1.writeMicroseconds(m1Signal);
+  motor2.writeMicroseconds(m2Signal);
+  motor3.writeMicroseconds(m3Signal);
+  motor4.writeMicroseconds(m4Signal);
+
+  // Debug
+  Serial.print("\tRoll:"); Serial.print(roll,2);
+  Serial.print("\tPitch:"); Serial.print(pitch,2);
+  Serial.print("\tM1:"); Serial.print(m1Signal);
+  Serial.print("\tM2:"); Serial.print(m2Signal);
+  Serial.print("\tM3:"); Serial.print(m3Signal);
+  Serial.print("\tM4:"); Serial.println(m4Signal);
+
+  delay(20);
 }
-
-// ============================ UTILITÁRIOS PARA TUNING ============================
-// Funções para ajustar PID e filtros em tempo de execução podem ser adicionadas,
-// por exemplo lendo comandos via Serial e atualizando pid_controller_roll.params.Kp etc.
-// Recomendo o seguinte fluxo para tunagem:
-// 1) Ajustar Kp para resposta rápida (pequenas oscilações).
-// 2) Adicionar Kd para amortecer.
-// 3) Ajustar Ki lentamente (corrige offset).
-// 4) Testar sem hélices e depois com hélices removidas até ter confiança.
-
