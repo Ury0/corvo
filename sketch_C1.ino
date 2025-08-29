@@ -4,7 +4,7 @@
 #include <Servo.h>
 
 // === GPS ===
-static const int RXPin = 0, TXPin = 1; 
+static const int RXPin = 7, TXPin = 8; 
 static const uint32_t GPSBaud = 9600;
 
 TinyGPSPlus gps;
@@ -126,7 +126,7 @@ float computePID(float setpoint, float input, float &errSum, float &lastErr, flo
 }
 
 // --- Motores ---
-#define M1 3
+#define M1 10
 #define M2 5
 #define M3 6
 #define M4 9
@@ -152,7 +152,7 @@ void setup(){
   motor3.writeMicroseconds(1000);
   motor4.writeMicroseconds(1000);
 
-  delay(2000); // arm ESCs
+  delay(5000); // arm ESCs
   Serial.println("IMU + GPS + Kalman + PID iniciado");
   lastMicros = micros();
 }
