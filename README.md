@@ -33,13 +33,13 @@ Este projeto implementa o controle de um **quadricóptero** utilizando **Arduino
 - SCL → A5 (Arduino UNO)  
 
 ### **GPS (Serial)**  
-- TX → RX (pino 0 do Arduino UNO)  
-- RX → TX (pino 1 do Arduino UNO)  
+- TX → RX (pino 7 do Arduino UNO)  
+- RX → TX (pino 8 do Arduino UNO)  
 - VCC → 5V  
 - GND → GND  
 
 ### **Motores / ESCs**  
-- Sinais PWM nos pinos: **3, 5, 6 e 9**  
+- Sinais PWM nos pinos: **10, 5, 6 e 9**  
 
 ---
 
