@@ -69,7 +69,7 @@ Este projeto implementa o controle de um **quadricóptero** utilizando **Arduino
 ---
 
 ## 📷 Demonstração  
-*(Adicionar fotos do protótipo ou esquemático de ligação aqui)*  
+![alt text](image.png)
 
 ---
 
