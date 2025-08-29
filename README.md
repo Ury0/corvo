@@ -74,4 +74,4 @@ Este projeto implementa o controle de um **quadricóptero** utilizando **Arduino
 ---
 
 ## 👤 Autor  
-Projeto desenvolvido por **[Seu Nome]** como parte de estudos em **sistemas embarcados, controle PID e robótica aérea**.  
+Projeto desenvolvido por Ury
