@@ -4,7 +4,7 @@
 #include <Servo.h>
 
 // === GPS ===
-static const int RXPin = 7, TXPin = 8; 
+static const int RXPin = 8, TXPin = 7; 
 static const uint32_t GPSBaud = 9600;
 
 TinyGPSPlus gps;
@@ -23,7 +23,9 @@ struct Kalman1D {
   float angle = 0, bias = 0;
   float P00=1, P01=0, P10=0, P11=1;
   float Q_angle=0.001f, Q_bias=0.003f, R_measure=0.03f;
+
   float update(float newAngle, float newRate, float dt) {
+    Serial.println("[Kalman] Update iniciado");
     float rate = newRate - bias;
     angle += dt * rate;
     P00 += dt*(dt*P11 - P01 - P10 + Q_angle);
@@ -42,9 +44,15 @@ struct Kalman1D {
     P01 -= K0 * P01_temp;
     P10 -= K1 * P00_temp;
     P11 -= K1 * P01_temp;
+    Serial.println("[Kalman] Update concluído");
+    Serial.println(angle);
     return angle;
   }
-  void setAngle(float a) { angle = a; }
+
+  void setAngle(float a) { 
+    Serial.println("[Kalman] SetAngle chamado");
+    angle = a; 
+  }
 };
 
 Kalman1D kfRoll, kfPitch, kfLat, kfLon;
@@ -53,13 +61,16 @@ unsigned long lastMicros = 0;
 
 // --- Funções MPU ---
 void setupMPU() {
+  Serial.println("[MPU] Setup iniciado");
   Wire.begin();
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x6B); Wire.write(0); 
   Wire.endTransmission(true);
+  Serial.println("[MPU] Setup concluído");
 }
 
 void readMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, int16_t &gz) {
+  Serial.println("[MPU] Leitura iniciada");
   Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(0x3B);
   Wire.endTransmission(false);
@@ -79,10 +90,18 @@ void readMPU(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &gy, in
   gx -= gx_off;
   gy -= gy_off;
   gz -= gz_off;
+
+  Serial.println("acell");
+  Serial.println(ax);Serial.println(ay);Serial.println(az);
+  Serial.println("gyro");
+  Serial.println(gx);Serial.println(gy);Serial.println(gz);
+
+  Serial.println("[MPU] Leitura concluída");
 }
 
 // --- Calibração ---
 void calibrateMPU() {
+  Serial.println("[MPU] Calibração iniciada");
   long ax_sum=0, ay_sum=0, az_sum=0;
   long gx_sum=0, gy_sum=0, gz_sum=0;
 
@@ -106,7 +125,13 @@ void calibrateMPU() {
   gy_off = gy_sum / N;
   gz_off = gz_sum / N;
 
-  Serial.println("Calibracao concluida!");
+  
+
+  Serial.println("acell off");
+  Serial.println(ax_off);Serial.println(ay_off);Serial.println(az_off);
+  Serial.println("gyro off");
+  Serial.println(gx_off);Serial.println(gy_off);Serial.println(gz_off);
+  Serial.println("[MPU] Calibração concluída!");
 }
 
 // --- PID ---
@@ -118,10 +143,12 @@ float errSumPitch=0, lastErrPitch=0;
 float errSumYaw=0, lastErrYaw=0;
 
 float computePID(float setpoint, float input, float &errSum, float &lastErr, float dt, float Kp, float Ki, float Kd) {
+  Serial.println("[PID] Cálculo iniciado");
   float error = setpoint - input;
   errSum += error * dt;
   float dErr = (error - lastErr) / dt;
   lastErr = error;
+  Serial.println("[PID] Cálculo concluído");
   return Kp * error + Ki * errSum + Kd * dErr;
 }
 
@@ -138,6 +165,7 @@ int throttle = 1200; // valor inicial
 void setup(){
   Serial.begin(115200);
   gpsSerial.begin(GPSBaud);
+  Serial.println("[Setup] Iniciando...");
 
   setupMPU();
   calibrateMPU(); // <<=== CALIBRAÇÃO AUTOMÁTICA
@@ -147,18 +175,21 @@ void setup(){
   motor3.attach(M3);
   motor4.attach(M4);
 
+  Serial.println("[Setup] Iniciando motores...");
+
   motor1.writeMicroseconds(1000);
   motor2.writeMicroseconds(1000);
   motor3.writeMicroseconds(1000);
   motor4.writeMicroseconds(1000);
 
   delay(5000); // arm ESCs
-  Serial.println("IMU + GPS + Kalman + PID iniciado");
+  Serial.println("[Setup] IMU + GPS + Kalman + PID iniciado");
   lastMicros = micros();
 }
 
 // --- Loop ---
 void loop() {
+  Serial.println("===== LOOP =====");
   unsigned long now = micros();
   float dt = (now - lastMicros) / 1e6;
   lastMicros = now;
@@ -179,6 +210,9 @@ void loop() {
   float roll  = kfRoll.update(rollAcc,gxds,dt);
   float pitch = kfPitch.update(pitchAcc,gyds,dt);
 
+  Serial.print("[Loop] RollAcc: "); Serial.print(rollAcc);
+  Serial.print(" PitchAcc: "); Serial.println(pitchAcc);
+
   // GPS leitura
   while (gpsSerial.available() > 0) {
     if (gps.encode(gpsSerial.read()) && gps.location.isUpdated()) {
@@ -186,8 +220,8 @@ void loop() {
         double lon = gps.location.lng();
         double latF = kfLat.update(lat, 0, dt);
         double lonF = kfLon.update(lon, 0, dt);
-        Serial.print("Lat:"); Serial.print(latF,6);
-        Serial.print("\tLon:"); Serial.print(lonF,6);
+        Serial.print("[GPS] Lat:"); Serial.print(latF,6);
+        Serial.print("\tLon:"); Serial.println(lonF,6);
     }
   }
 
@@ -196,6 +230,8 @@ void loop() {
   float rollPID  = computePID(setRoll, roll,  errSumRoll,  lastErrRoll,  dt, Kp, Ki, Kd);
   float pitchPID = computePID(setPitch, pitch, errSumPitch, lastErrPitch, dt, Kp, Ki, Kd);
   float yawPID   = computePID(setYaw, 0, errSumYaw, lastErrYaw, dt, Kp_yaw, Ki_yaw, Kd_yaw);
+
+  Serial.println("[Loop] PID calculado");
 
   int m1Signal = throttle + pitchPID + rollPID - yawPID;
   int m2Signal = throttle + pitchPID - rollPID + yawPID;
@@ -220,5 +256,6 @@ void loop() {
   Serial.print("\tM3:"); Serial.print(m3Signal);
   Serial.print("\tM4:"); Serial.println(m4Signal);
 
+  Serial.println("===== FIM LOOP =====");
   delay(20);
 }
