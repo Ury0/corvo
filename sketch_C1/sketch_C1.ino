@@ -1,5 +1,8 @@
+#include <Servo.h>
+
 #include <Wire.h>
 
+#define m 9
 #define MPU_ADDR 0x68  // Endereço padrão do MPU6050
 
 // Variáveis para armazenar valores crus do MPU6050
@@ -21,14 +24,14 @@ float derivativo = 0;
 unsigned long tempo_anterior = 0;
 
 // ==== Pino de saída para motor (PWM) ====
-const int motorPin = 9; // Saída PWM para controlar motor
+Servo motor; // Saída PWM para controlar motor
 
 void setup() {
   Serial.begin(9600);
   Wire.begin();
 
   // Inicializa pino do motor
-  pinMode(motorPin, OUTPUT);
+  motor.attach(m);
 
   // ==== Inicializa o MPU6050 ====
   Wire.beginTransmission(MPU_ADDR);
@@ -49,6 +52,12 @@ void setup() {
   Wire.endTransmission();
 
   Serial.println("MPU6050 inicializado!");
+  motor.writeMicroseconds(1500);
+  delay(3000);
+  motor.writeMicroseconds(2000);
+  delay(3000);
+  motor.writeMicroseconds(1000);
+  delay(3000);
 }
 
 void loop() {
@@ -95,13 +104,14 @@ void loop() {
   derivativo = (erro - erro_anterior) / dt;
 
   saida = (Kp * erro) + (Ki * integral) + (Kd * derivativo);
+  
   erro_anterior = erro;
 
   // Limita a saída do PID para faixa de PWM (0 a 255)
-  int pwm = constrain(map(saida, -50, 50, 0, 255), 0, 255);
+  int pwm = map(saida, -50, 50, 1000, 2000);
 
   // Aplica PWM no motor
-  analogWrite(motorPin, pwm);
+  motor.writeMicroseconds(pwm);
 
   // ==== Serial Monitor ====
   Serial.print("Angulo (Pitch): "); Serial.print(entrada);
