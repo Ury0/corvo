@@ -4,7 +4,7 @@
 
 #define m 9
 #define MPU_ADDR 0x68  // Endereço padrão do MPU6050
-
+unsigned long tempo_atual;
 // Variáveis para armazenar valores crus do MPU6050
 int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
 
@@ -30,9 +30,7 @@ void setup() {
   Serial.begin(9600);
   Wire.begin();
 
-  // Inicializa pino do motor
-  motor.attach(m);
-
+  
   // ==== Inicializa o MPU6050 ====
   Wire.beginTransmission(MPU_ADDR);
   Wire.write(0x6B);   // Registrador PWR_MGMT_1
@@ -51,13 +49,12 @@ void setup() {
   Wire.write(0b00011000);
   Wire.endTransmission();
 
-  Serial.println("MPU6050 inicializado!");
-  motor.writeMicroseconds(1500);
-  delay(3000);
-  motor.writeMicroseconds(2000);
-  delay(3000);
+  // Inicializa pino do motor
+  motor.attach(m);
+  tempo_atual = millis();
+  
   motor.writeMicroseconds(1000);
-  delay(3000);
+  delay(7000);
 }
 
 void loop() {
@@ -95,7 +92,7 @@ void loop() {
   entrada = atan2(Ay, Az) * 180 / PI;
 
   // ==== PID ====
-  unsigned long tempo_atual = millis();
+  tempo_atual = millis();
   float dt = (tempo_atual - tempo_anterior) / 1000.0; // tempo em segundos
   tempo_anterior = tempo_atual;
 
