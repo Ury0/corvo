@@ -9,9 +9,9 @@ unsigned long tempo_atual;
 int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
 
 // ==== Variáveis do PID ====
-float Kp = 1.5;   // Ganho Proporcional
-float Ki = 0.05;  // Ganho Integral
-float Kd = 0.8;   // Ganho Derivativo
+float Kp = 1.0;   // Ganho Proporcional
+float Ki = 1.0;  // Ganho Integral
+float Kd = 1.0;   // Ganho Derivativo
 
 float setpoint = 0.0; // Ângulo desejado (ex.: 0 graus)
 float entrada;        // Ângulo atual do MPU6050
